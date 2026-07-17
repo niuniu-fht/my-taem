@@ -334,20 +334,31 @@ def register_account(
             detail = str(exc)
             if "401" not in detail and "invalid_token" not in detail.lower():
                 raise
-            lf(f"企业资料切换遇到 401,转授权刷新获取子号 token:{detail[:160]}")
-            lf("401 后等待 1 秒再进入 FF-iOS 授权刷新…")
-            time.sleep(1)
+            lf(f"企业资料切换遇到 401,将重新登录获取新会话:{detail[:160]}")
+            lf("等待 30 秒让企业资料状态生效,随后重新验证码登录…")
+            time.sleep(30)
             from app.services import firefly_ios
 
-            ios_result = firefly_ios.mint_ff_ios_device_token(
-                client, auth.susi_token, email, log=lf
+            relogin_refresh_token = (
+                holder.refresh_token if holder.rotated else refresh_token
+            )
+            ios_result = firefly_ios.login_pool_ff_ios(
+                email=email,
+                refresh_token=relogin_refresh_token,
+                client_id=client_id,
+                mail_url=mail_url,
+                proxy_url=proxy_url,
+                otp_timeout=otp_timeout,
+                use_proxy_for_mail=bool(proxy_url),
+                complete_profile=False,
+                log=lf,
             )
         token = (
             (ios_result or {}).get("access_token")
             if ios_result is not None
             else _acquire_firefly_token(auth, lf)
         )
-        cookie = _adm._session_cookie_str(client)
+        cookie = (ios_result or {}).get("cookie") or _adm._session_cookie_str(client)
 
         info = fetch_account_info(token, proxy_url) or {}
         user_id = info.get("user_id") or extract_account_id(token)
@@ -371,7 +382,10 @@ def register_account(
             "user_id": user_id,
             "device_token": (ios_result or {}).get("device_token") or "",
             "device_id": (ios_result or {}).get("device_id") or "",
-            "rotated_refresh_token": holder.refresh_token if holder.rotated else "",
+            "rotated_refresh_token": (
+                (ios_result or {}).get("rotated_refresh_token")
+                or (holder.refresh_token if holder.rotated else "")
+            ),
         }
     finally:
         try:

@@ -1216,6 +1216,7 @@ def batch_authorize_login_members(
             row.registered = team_ready
             row.display_name = rec.get("display_name") or row.display_name
             row.access_token = access_token
+            row.cookie = rec.get("cookie") or row.cookie
             row.device_token = rec.get("device_token") or row.device_token
             row.device_id = rec.get("device_id") or row.device_id
             row.credits = credits

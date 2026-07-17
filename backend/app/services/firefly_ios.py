@@ -760,6 +760,7 @@ def login_pool_ff_ios(
     proxy_url: str = "",
     otp_timeout: int = 180,
     use_proxy_for_mail: bool = False,
+    complete_profile: bool = True,
     log: Optional[LogFn] = None,
 ) -> dict[str, Any]:
     """号池账号免密码登录拿 FF-iOS 受信任 token(签名对齐 firefly.register_account)。
@@ -770,7 +771,11 @@ def login_pool_ff_ios(
     """
     # 延迟导入,避免循环依赖
     from app.services.adobe_otp import make_otp_poller
-    from app.services.adobe_admin import _passwordless_login, complete_sub_account
+    from app.services.adobe_admin import (
+        _passwordless_login,
+        _session_cookie_str,
+        complete_sub_account,
+    )
     from app.services.adobe_protocol.admin_member_protocol import AdminAuth
     from app.services.firefly import CLIO_CLIENT_ID, FIREFLY_REDIRECT, FIREFLY_SCOPE
     from app.services.adobe_protocol import admin_member_protocol as _p
@@ -797,10 +802,13 @@ def login_pool_ff_ios(
             raise FireflyIOSError("验证码登录未拿到会话 token")
         # 补全资料 + 激活企业(被邀请)资料,并把 susi 切到实体资料
         # (与 okad 正常流程一致;FF-iOS 设备授权要求实体资料处于激活态)
-        try:
-            complete_sub_account(auth, email, lf)
-        except Exception as e:
-            lf(f"补全/激活资料(忽略):{str(e)[:120]}")
+        if complete_profile:
+            try:
+                complete_sub_account(auth, email, lf)
+            except Exception as e:
+                lf(f"补全/激活资料(忽略):{str(e)[:120]}")
+        else:
+            lf(f"[{email}] 企业资料已激活,跳过重复补全/激活")
         session_susi = auth.susi_token
 
         # 阶段二:同会话兑换 FF-iOS 设备 token(无需密码)
@@ -808,6 +816,7 @@ def login_pool_ff_ios(
             client, session_susi, email,
             device_id=device_id, proxy_url=proxy_url, log=lf,
         )
+        rec["cookie"] = _session_cookie_str(client)
         rec["rotated_refresh_token"] = holder.refresh_token if holder.rotated else ""
         return rec
     finally:
