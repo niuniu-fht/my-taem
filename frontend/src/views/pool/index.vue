@@ -37,6 +37,7 @@ import {
   importPool,
   listPool,
   refreshPoolARP,
+  refreshPoolCookie,
   refreshPoolToken,
   testPoolMail,
   testPoolImage,
@@ -389,6 +390,21 @@ const columns = computed<DataTableColumns<PoolItem>>(() => [
       ]),
   },
   {
+    title: 'Cookie续期',
+    key: 'cookie_refresh_ready',
+    width: 100,
+    render: (row) =>
+      h(
+        NTag,
+        {
+          type: row.cookie_refresh_ready ? 'success' : 'default',
+          size: 'small',
+          bordered: false,
+        },
+        () => (row.cookie_refresh_ready ? '可续期' : '待获取'),
+      ),
+  },
+  {
     title: '过期时间',
     key: 'expires_at',
     width: 200,
@@ -404,7 +420,7 @@ const columns = computed<DataTableColumns<PoolItem>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 380,
+    width: 480,
     fixed: 'right',
     render: (row) =>
       h(NSpace, { size: 4 }, () => [
@@ -437,6 +453,18 @@ const columns = computed<DataTableColumns<PoolItem>>(() => [
           NButton,
           {
             size: 'small',
+            type: 'success',
+            secondary: true,
+            loading: refreshingCookieId.value === row.id,
+            disabled: refreshingCookieId.value !== null,
+            onClick: () => handleRefreshCookie(row),
+          },
+          () => '重取Cookie',
+        ),
+        h(
+          NButton,
+          {
+            size: 'small',
             type: 'info',
             secondary: true,
             loading: refreshingARPId.value === row.id,
@@ -463,6 +491,7 @@ const columns = computed<DataTableColumns<PoolItem>>(() => [
 // ===== 刷新 AT =====
 const refreshingId = ref<number | null>(null)
 const refreshingARPId = ref<number | null>(null)
+const refreshingCookieId = ref<number | null>(null)
 const testingMailId = ref<number | null>(null)
 
 async function handleTestMail(row: PoolItem) {
@@ -491,6 +520,21 @@ async function handleRefresh(row: PoolItem) {
     await fetchData()
   } finally {
     refreshingId.value = null
+  }
+}
+
+async function handleRefreshCookie(row: PoolItem) {
+  refreshingCookieId.value = row.id
+  try {
+    const res = await refreshPoolCookie(row.id)
+    if (res.success) {
+      window.$message?.success(res.message)
+    } else {
+      window.$message?.warning(res.message)
+    }
+    await fetchData()
+  } finally {
+    refreshingCookieId.value = null
   }
 }
 
@@ -853,7 +897,7 @@ onMounted(() => {
         :loading="loading"
         :row-key="(row: PoolItem) => row.id"
         v-model:checked-row-keys="checkedRowKeys"
-        :scroll-x="1600"
+        :scroll-x="2300"
         remote
         :pagination="{
           page: pagination.page,

@@ -28,6 +28,7 @@ from app.schemas.adobe_account import (
     PoolMoeMailGenerateRequest,
     RefreshARPRequest,
     RefreshARPResult,
+    RefreshCookieResult,
     RefreshTokenResult,
     TestImageRequest,
     TestImageResult,
@@ -150,6 +151,7 @@ def _to_item(member, admin_email: str) -> PoolItemOut:
         has_token=bool(member.access_token),
         has_cookie=bool(member.cookie),
         has_arp=bool(member.arp_session_id),
+        cookie_refresh_ready=pool_login.cookie_refresh_ready(member.cookie or ""),
         created_at=member.created_at,
     )
 
@@ -419,6 +421,21 @@ def refresh_token(member_id: int, db: Session = Depends(get_db)) -> RefreshToken
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="条目不存在")
     res = pool_login.refresh_one_sync(member_id)
     return RefreshTokenResult(**res)
+
+
+@router.post(
+    "/{member_id}/refresh-cookie",
+    response_model=RefreshCookieResult,
+    summary="重新登录获取可续期 Web Cookie",
+)
+def refresh_cookie(member_id: int, db: Session = Depends(get_db)) -> RefreshCookieResult:
+    member = member_crud.get(db, member_id)
+    if not member:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="条目不存在")
+    result = pool_login.refresh_cookie_sync(
+        member_id, log=lambda message: print(message, flush=True)
+    )
+    return RefreshCookieResult(**result)
 
 
 @router.post("/{member_id}/refresh-arp", response_model=RefreshARPResult, summary="浏览器捕获ARP")

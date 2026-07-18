@@ -777,7 +777,12 @@ def login_pool_ff_ios(
         complete_sub_account,
     )
     from app.services.adobe_protocol.admin_member_protocol import AdminAuth
-    from app.services.firefly import CLIO_CLIENT_ID, FIREFLY_REDIRECT, FIREFLY_SCOPE
+    from app.services.firefly import (
+        CLIO_CLIENT_ID,
+        FIREFLY_REDIRECT,
+        FIREFLY_SCOPE,
+        _acquire_firefly_token,
+    )
     from app.services.adobe_protocol import admin_member_protocol as _p
 
     lf = _mklog(log)
@@ -810,6 +815,12 @@ def login_pool_ff_ios(
         else:
             lf(f"[{email}] 企业资料已激活,跳过重复补全/激活")
         session_susi = auth.susi_token
+
+        try:
+            _acquire_firefly_token(auth, lf)
+            lf(f"[{email}] ✓ Firefly Web 会话 Cookie 已补全")
+        except Exception as exc:
+            lf(f"[{email}] Firefly Web 会话 Cookie 补全失败:{str(exc)[:160]}")
 
         # 阶段二:同会话兑换 FF-iOS 设备 token(无需密码)
         rec = mint_ff_ios_device_token(

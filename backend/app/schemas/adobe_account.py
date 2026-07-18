@@ -130,6 +130,7 @@ class PoolItemOut(BaseModel):
     has_token: bool = False
     has_cookie: bool = False
     has_arp: bool = False
+    cookie_refresh_ready: bool = False
     created_at: datetime
 
 
@@ -201,6 +202,12 @@ class RefreshTokenResult(BaseModel):
     message: str
     credits: float | None = None
     expires_at: int | None = None
+
+
+class RefreshCookieResult(BaseModel):
+    success: bool
+    message: str
+    cookie_refresh_ready: bool = False
 
 
 class PoolBatchLoginFilter(BaseModel):

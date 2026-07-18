@@ -18,6 +18,7 @@ export interface PoolItem {
   has_token: boolean
   has_cookie: boolean
   has_arp: boolean
+  cookie_refresh_ready: boolean
   created_at: string
 }
 
@@ -178,6 +179,12 @@ export interface RefreshARPResult {
   has_access_token: boolean
 }
 
+export interface RefreshCookieResult {
+  success: boolean
+  message: string
+  cookie_refresh_ready: boolean
+}
+
 export function getPoolMember(id: number): Promise<PoolMemberDetail> {
   return request.get(`/pool/${id}`)
 }
@@ -212,6 +219,10 @@ export function testPoolImage(
 export function refreshPoolToken(id: number): Promise<RefreshTokenResult> {
   // 协议登录刷新 AT,OTP 最长约 3 分钟
   return request.post(`/pool/${id}/refresh-token`, {}, { timeout: 220000 })
+}
+
+export function refreshPoolCookie(id: number): Promise<RefreshCookieResult> {
+  return request.post(`/pool/${id}/refresh-cookie`, {}, { timeout: 240000 })
 }
 
 export function refreshPoolARP(

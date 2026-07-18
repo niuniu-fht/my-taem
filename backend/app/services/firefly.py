@@ -350,7 +350,7 @@ def register_account(
                 proxy_url=proxy_url,
                 otp_timeout=otp_timeout,
                 use_proxy_for_mail=bool(proxy_url),
-                complete_profile=False,
+                complete_profile=True,
                 log=lf,
             )
         token = (

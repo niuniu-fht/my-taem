@@ -19,6 +19,22 @@ from app.services import firefly, firefly_ios, proxy_pool
 from app.services.job_manager import Job
 
 
+COOKIE_REFRESH_REQUIRED = frozenset({"ims_sid", "aux_sid", "fg"})
+
+
+def cookie_refresh_ready(cookie: str) -> bool:
+    names = {
+        part.split("=", 1)[0].strip()
+        for part in str(cookie or "").split(";")
+        if "=" in part
+    }
+    return COOKIE_REFRESH_REQUIRED.issubset(names)
+
+
+def _refreshable_cookie_or_existing(new_cookie: str, existing_cookie: str) -> str:
+    return new_cookie if cookie_refresh_ready(new_cookie) else existing_cookie
+
+
 def _login_one(payload: dict, proxy_raw: str, job: Job) -> bool:
     email = payload["email"]
     mid = payload["id"]
@@ -86,6 +102,9 @@ def _login_one(payload: dict, proxy_raw: str, job: Job) -> bool:
             extra={
                 "registered": False,
                 "display_name": rec.get("display_name") or "",
+                "cookie": _refreshable_cookie_or_existing(
+                    rec.get("cookie") or "", payload.get("cookie") or ""
+                ),
                 "access_token": access_token,
                 "device_token": rec.get("device_token") or "",
                 "device_id": rec.get("device_id") or "",
@@ -104,6 +123,9 @@ def _login_one(payload: dict, proxy_raw: str, job: Job) -> bool:
         extra={
             "registered": True,
             "display_name": rec.get("display_name") or "",
+            "cookie": _refreshable_cookie_or_existing(
+                rec.get("cookie") or "", payload.get("cookie") or ""
+            ),
             "access_token": access_token,
             "device_token": rec.get("device_token") or "",
             "device_id": rec.get("device_id") or "",
@@ -166,6 +188,7 @@ def _build_payloads(db, member_ids: list[int]) -> list[dict]:
                 "client_id": cid,
                 "mail_url": mail_url,
                 "device_id": m.device_id or "",
+                "cookie": m.cookie or "",
             }
         )
     db.commit()
@@ -472,6 +495,102 @@ def refresh_one_sync(member_id: int, log=None) -> dict:
     lf(f"[{email}] ✓ 已获取 FF-iOS token,额度 {credits}")
     return {"success": True, "message": "已获取 FF-iOS 受信任 token 并查询额度",
             "credits": credits, "expires_at": expires_at}
+
+
+def refresh_cookie_sync(member_id: int, log=None) -> dict:
+    lf = log if callable(log) else (lambda _m: None)
+    db = SessionLocal()
+    try:
+        member = member_crud.get(db, member_id)
+        if not member:
+            return {
+                "success": False,
+                "message": "条目不存在",
+                "cookie_refresh_ready": False,
+            }
+        email = member.email
+        current_status = member.status or ("registered" if member.registered else "")
+        current_cookie = member.cookie or ""
+        device_id = member.device_id or ""
+        settings = setting_crud.get_settings(db)
+        proxy_raw = settings.proxy_url if settings.proxy_enabled else ""
+        refresh_token, client_id, mail_url = _resolve_creds(db, member)
+    finally:
+        db.close()
+
+    if not ((refresh_token and client_id) or mail_url):
+        return {
+            "success": False,
+            "message": "缺少子号 Refresh Token / Client ID 或取信配置",
+            "cookie_refresh_ready": cookie_refresh_ready(current_cookie),
+        }
+
+    proxy_url = proxy_pool.next_proxy(proxy_raw)
+    lf(f"[{email}] 重新登录并建立 Firefly Web 会话 Cookie…")
+    try:
+        rec = firefly_ios.login_pool_ff_ios(
+            email=email,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            mail_url=mail_url,
+            device_id=device_id,
+            proxy_url=proxy_url,
+            otp_timeout=180,
+            use_proxy_for_mail=bool(proxy_url),
+            complete_profile=True,
+            log=lambda message: lf(f"[{email}] {message}"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "message": f"重新登录失败:{str(exc)[:200]}",
+            "cookie_refresh_ready": cookie_refresh_ready(current_cookie),
+        }
+
+    cookie = rec.get("cookie") or ""
+    ready = cookie_refresh_ready(cookie)
+    extra = {
+        "access_token": rec.get("access_token") or "",
+        "device_token": rec.get("device_token") or "",
+        "device_id": rec.get("device_id") or device_id,
+        "expires_at": rec.get("expires_at"),
+        "refresh_token": rec.get("rotated_refresh_token") or refresh_token,
+    }
+    if ready:
+        extra["cookie"] = cookie
+        _save(
+            member_id,
+            status=current_status,
+            message="已重新获取可续期 Web Cookie",
+            extra=extra,
+        )
+        return {
+            "success": True,
+            "message": "已重新获取可用于 adobe2api 续期的 Cookie",
+            "cookie_refresh_ready": True,
+        }
+
+    _save(
+        member_id,
+        status=current_status,
+        message="重新登录成功，但 Web Cookie 字段不完整",
+        extra=extra,
+    )
+    missing = ", ".join(
+        sorted(
+            COOKIE_REFRESH_REQUIRED
+            - {
+                part.split("=", 1)[0].strip()
+                for part in cookie.split(";")
+                if "=" in part
+            }
+        )
+    )
+    return {
+        "success": False,
+        "message": f"Web Cookie 字段不完整，缺少:{missing}",
+        "cookie_refresh_ready": cookie_refresh_ready(current_cookie),
+    }
 
 
 def _run_round(payloads: list[dict], proxy_raw: str, concurrency: int, job: Job) -> None:
