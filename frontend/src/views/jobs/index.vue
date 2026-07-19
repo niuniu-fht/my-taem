@@ -6,6 +6,7 @@ import {
   NEmpty,
   NGrid,
   NGridItem,
+  NInput,
   NPopconfirm,
   NProgress,
   NScrollbar,
@@ -45,11 +46,12 @@ let timer: number | undefined
 const TYPE_LABEL: Record<string, string> = {
   build_team: '单主号拉号',
   build_team_batch: '批量拉号',
+  replace_member: '移除并安全补号',
   admin_relogin_batch: '母号检测重登',
   pool_login: '号池批量登录',
 }
 
-const CANCELLABLE_TYPES = new Set(['build_team', 'build_team_batch'])
+const CANCELLABLE_TYPES = new Set(['build_team', 'build_team_batch', 'replace_member'])
 
 function statusTag(status: string) {
   if (status === 'running')
@@ -181,6 +183,33 @@ const overallPercent = computed(() => {
   if (!d || !d.target) return 0
   return Math.min(100, Math.round((d.success / d.target) * 100))
 })
+
+const detailCookie = computed(() => {
+  const result = detail.value?.result as
+    | { replacement?: { cookie?: string } }
+    | null
+    | undefined
+  return result?.replacement?.cookie || ''
+})
+
+async function copyDetailCookie() {
+  const cookie = detailCookie.value
+  if (!cookie) return
+  try {
+    await navigator.clipboard.writeText(cookie)
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = cookie
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.focus()
+    textarea.select()
+    document.execCommand('copy')
+    textarea.remove()
+  }
+  window.$message?.success('Cookie 已复制')
+}
 
 async function loadList() {
   jobs.value = await listJobs(30)
@@ -422,6 +451,21 @@ onUnmounted(() => {
             size="small"
             :max-height="240"
           />
+
+          <NSpace v-if="detailCookie" vertical size="small">
+            <NSpace align="center" justify="space-between">
+              <NText strong>新补子号 Cookie</NText>
+              <NButton type="primary" secondary size="small" @click="copyDetailCookie">
+                复制 Cookie
+              </NButton>
+            </NSpace>
+            <NInput
+              :value="detailCookie"
+              type="textarea"
+              readonly
+              :autosize="{ minRows: 3, maxRows: 8 }"
+            />
+          </NSpace>
 
           <div>
             <NSpace align="center" justify="space-between" style="margin-bottom: 6px">

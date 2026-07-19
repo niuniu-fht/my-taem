@@ -1,3 +1,4 @@
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -29,6 +30,8 @@ from app.schemas.adobe_account import (
     MemberOut,
     QuickAddAccountRequest,
     QuickAddAccountResult,
+    ReplaceMemberCookieResult,
+    ReplaceMemberRequest,
     TestEmailResult,
 )
 from app.schemas.common import (
@@ -38,7 +41,7 @@ from app.schemas.common import (
     MessageResult,
     Page,
 )
-from app.services import adobe_admin, firefly, firefly_ios, proxy_pool, team_builder
+from app.services import adobe_admin, firefly, firefly_ios, member_removal, proxy_pool, team_builder
 from app.services.job_manager import JOBS
 from app.services.mail_test import test_receive_email
 
@@ -1268,72 +1271,18 @@ def batch_delete_members(
     if not account:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在")
 
-    proxy_raw, _timeout = _proxy_and_timeout(db)
     rows = member_crud.delete_many(db, account_id, payload.ids)
     if not rows:
         return MessageResult(message="未找到要移除的成员")
-
-    def _can_local_cleanup(row) -> bool:
-        status_text = str(row.status or "").strip().lower()
-        if status_text in {"failed", "removed_failed"}:
-            return True
-        try:
-            return row.credits is not None and float(row.credits) <= 0
-        except (TypeError, ValueError):
-            return False
-
-    needs_remote = [row for row in rows if not _can_local_cleanup(row)]
-    can_remote = bool(account.admin_token and account.org_id)
-    if needs_remote and not can_remote:
+    proxy_raw, _timeout = _proxy_and_timeout(db)
+    try:
+        result = member_removal.remove_members(db, account, rows, proxy_raw)
+    except member_removal.MemberRemovalError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="尚未登录,只能本地移除失败/额度用完的成员;正常成员请先登录后再移除",
-        )
-
-    removed = 0
-    local_cleaned = 0
-    remote_failed = 0
-    removed_emails: list[str] = []
-    for row in rows:
-        local_cleanup = _can_local_cleanup(row)
-        res = {"ok": False, "message": ""}
-        if can_remote:
-            try:
-                res = adobe_admin.remove_member(
-                    token=account.admin_token,
-                    org_id=account.org_id,
-                    member_id=row.member_id,
-                    email=row.email,
-                    proxy_url=proxy_pool.next_proxy(proxy_raw),
-                )
-            except Exception as exc:  # noqa: BLE001
-                res = {"ok": False, "message": str(exc)[:200]}
-        if res.get("ok") or local_cleanup:
-            removed_emails.append(row.email)
-            db.delete(row)
-            removed += 1
-            if local_cleanup and not res.get("ok"):
-                local_cleaned += 1
-        else:
-            remote_failed += 1
-            row.status = "removed_failed"
-            row.message = res.get("message") or "移除失败"
-
-    deleted_emails = email_crud.delete_by_emails(
-        db,
-        removed_emails,
-        exclude_emails={account.email},
-    )
-    account.member_count = member_crud.count_by_admin(db, account_id)
-    db.commit()
-    message = f"已移除 {removed} / {len(rows)} 个成员"
-    if deleted_emails:
-        message += f",并删除邮箱管理记录 {deleted_emails} 条"
-    if local_cleaned:
-        message += f",其中本地清理 {local_cleaned} 个失败/额度用完成员"
-    if remote_failed:
-        message += f",远端移除失败 {remote_failed} 个"
-    return MessageResult(message=message)
+            detail=str(exc),
+        ) from exc
+    return MessageResult(message=str(result["message"]))
 
 
 @router.post(
@@ -1365,6 +1314,92 @@ def build_team(
         meta={"admin_id": account_id, "count": count, "target": count, "mode": mode},
     )
     return JobStatusOut(**job.to_dict())
+
+
+@router.post(
+    "/replace-member", response_model=JobStatusOut, summary="移除子号并安全补一个"
+)
+def replace_member(payload: ReplaceMemberRequest, db: Session = Depends(get_db)) -> JobStatusOut:
+    job = _get_or_start_replace_member_job(payload.email, db)
+    return JobStatusOut(**job.to_dict())
+
+
+def _get_or_start_replace_member_job(email: str, db: Session):
+    email = email.strip().lower()
+    row = member_crud.find_child_by_email(db, email)
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"未找到子号:{email}",
+        )
+    existing = JOBS.find_active("replace_member", row.admin_id)
+    if existing:
+        existing_email = str(existing.meta.get("email") or "").strip().lower()
+        if existing_email != email:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"母号正在处理另一个子号:{existing_email};"
+                    f"请等待任务 #{existing.id} 完成"
+                ),
+            )
+        return existing
+    return JOBS.start(
+        "replace_member",
+        team_builder.replace_member_worker,
+        meta={"admin_id": row.admin_id, "email": email, "target": 1},
+    )
+
+
+@router.post(
+    "/replace-member-cookie",
+    response_model=ReplaceMemberCookieResult,
+    summary="同步移除子号、安全补号并返回 Cookie",
+)
+def replace_member_cookie(
+    payload: ReplaceMemberRequest, db: Session = Depends(get_db)
+) -> ReplaceMemberCookieResult:
+    source_email = payload.email.strip().lower()
+    job = _get_or_start_replace_member_job(source_email, db)
+    deadline = time.monotonic() + 900
+    while job.status == "running" and time.monotonic() < deadline:
+        time.sleep(0.5)
+
+    if job.status == "running":
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"任务 #{job.id} 仍在运行,请在拉号任务中查看进度",
+        )
+
+    snapshot = job.to_dict()
+    if job.status != "done":
+        message = job.error or f"任务状态:{job.status}"
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"任务 #{job.id} 未完成:{message}",
+        )
+
+    result = snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {}
+    replacement = (
+        result.get("replacement")
+        if isinstance(result.get("replacement"), dict)
+        else {}
+    )
+    cookie = str(replacement.get("cookie") or "").strip()
+    replacement_email = str(replacement.get("email") or "").strip()
+    if not cookie:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"任务 #{job.id} 已结束,但新补子号未返回 Cookie",
+        )
+
+    return ReplaceMemberCookieResult(
+        job_id=job.id,
+        source_email=source_email,
+        replacement_email=replacement_email,
+        cookie=cookie,
+        logs=list(snapshot.get("logs") or []),
+    )
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatusOut, summary="查询拉号任务进度")

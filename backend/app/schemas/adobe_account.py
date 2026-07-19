@@ -238,6 +238,23 @@ class BuildTeamRequest(BaseModel):
     mode: str = "fill"  # fill / one_by_one
 
 
+class ReplaceMemberRequest(BaseModel):
+    """按子号邮箱定位母号,移除后等待并安全补一个。"""
+
+    email: str = Field(min_length=3)
+
+
+class ReplaceMemberCookieResult(BaseModel):
+    """同步替换接口的最终结果。"""
+
+    success: bool = True
+    job_id: int
+    source_email: str
+    replacement_email: str
+    cookie: str
+    logs: list[str] = []
+
+
 class BatchBuildTeamRequest(BaseModel):
     admin_ids: list[int] = []
     count: int = 9

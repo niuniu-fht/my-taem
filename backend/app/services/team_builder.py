@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import time
 
 from app.crud import adobe_account as adobe_crud
 from app.crud import adobe_member as member_crud
 from app.crud import email as email_crud
 from app.crud import setting as setting_crud
 from app.db.session import SessionLocal
-from app.services import adobe_admin, firefly, pool_claim, proxy_pool
+from app.services import adobe_admin, firefly, member_removal, pool_claim, proxy_pool
 from app.services.job_manager import Job
 
 
@@ -655,5 +656,155 @@ def build_team_batch_worker(job: Job) -> None:
             job.log("=== 批量拉号已手动停止 ===")
         job.result = {"teams": len(admin_ids), "fully_done": done}
         job.log(f"=== 批量完成:{done}/{len(admin_ids)} 个主号已凑满 ===")
+    finally:
+        db.close()
+
+
+def replace_member_worker(job: Job) -> None:
+    """Remove a child by email, wait five seconds, then safely add one replacement."""
+    email = str(job.meta.get("email") or "").strip().lower()
+    db = SessionLocal()
+    try:
+        row = member_crud.find_child_by_email(db, email)
+        if not row:
+            job.status = "error"
+            job.error = f"未找到子号:{email}"
+            job.log(job.error)
+            return
+
+        account = adobe_crud.get(db, row.admin_id)
+        if not account:
+            job.status = "error"
+            job.error = "子号对应的母号不存在"
+            job.log(job.error)
+            return
+
+        settings = setting_crud.get_settings(db)
+        proxy_raw = settings.proxy_url if settings.proxy_enabled else ""
+        concurrency = max(1, min(int(settings.concurrency or 1), _BUILD_CONCURRENCY_CAP))
+        job.target = 1
+        team = {
+            "admin_id": account.id,
+            "email": account.email,
+            "target": 1,
+            "success": 0,
+            "fail": 0,
+            "status": "running",
+            "message": "",
+            "prefix": "",
+        }
+        job.set_extra("teams", [team])
+        job.log(f"已找到子号 [{email}],母号 [{account.email}]")
+
+        try:
+            result = member_removal.remove_members(
+                db,
+                account,
+                [row],
+                proxy_raw,
+                log=job.log,
+            )
+        except member_removal.MemberRemovalError as exc:
+            team["status"] = "error"
+            team["message"] = str(exc)
+            job.status = "error"
+            job.error = str(exc)
+            job.log(f"✗ {exc}")
+            job.set_extra("teams", [team])
+            return
+
+        if int(result.get("removed") or 0) != 1:
+            team["status"] = "error"
+            team["message"] = str(result.get("message") or "移除失败")
+            job.status = "error"
+            job.error = team["message"]
+            job.set_extra("teams", [team])
+            return
+
+        if job.cancelled:
+            team["status"] = "cancelled"
+            team["message"] = "已移除,但在等待补号前停止"
+            job.status = "cancelled"
+            job.log("已停止:不会继续安全补号")
+            job.set_extra("teams", [team])
+            return
+
+        job.log("移除完成,等待 5 秒后开始安全补号")
+        for remaining in range(5, 0, -1):
+            if job.cancelled:
+                team["status"] = "cancelled"
+                team["message"] = "已移除,但在等待补号前停止"
+                job.status = "cancelled"
+                job.log("已停止:不会继续安全补号")
+                job.set_extra("teams", [team])
+                return
+            job.log(f"等待 {remaining} 秒 …")
+            time.sleep(1)
+
+        if job.cancelled:
+            team["status"] = "cancelled"
+            team["message"] = "已移除,但在补号前停止"
+            job.status = "cancelled"
+            job.set_extra("teams", [team])
+            return
+
+        if not _ensure_admin(db, account, proxy_raw, job, ""):
+            team["status"] = "error"
+            team["message"] = account.check_message or "未取得管理权限"
+            job.status = "error"
+            job.error = team["message"]
+            job.set_extra("teams", [team])
+            return
+
+        # The one-by-one mode uses the current registered count as its baseline.
+        # Adding one to that baseline restores exactly the removed slot.
+        safe_target = max(1, member_crud.count_registered(db, account.id) + 1)
+        before_member_ids = {
+            member.id
+            for member in member_crud.list_by_admin(db, account.id, page=1, size=1000)[0]
+        }
+        job.log(f"开始安全补号:目标 {safe_target},本轮只补 1 个成功子号")
+        _build_one_team(
+            db,
+            job,
+            account,
+            safe_target,
+            proxy_raw,
+            concurrency,
+            team,
+            mode="one_by_one",
+        )
+        job.set_extra("teams", [team])
+        after_members, _ = member_crud.list_by_admin(
+            db, account.id, page=1, size=1000
+        )
+        replacement_member = next(
+            (
+                member
+                for member in reversed(after_members)
+                if member.id not in before_member_ids
+                and member.registered
+                and str(member.cookie or "").strip()
+            ),
+            None,
+        )
+        replacement_cookie = str(replacement_member.cookie or "").strip() if replacement_member else ""
+        job.result = {
+            "email": email,
+            "admin_id": account.id,
+            "replacement_target": safe_target,
+            "replacement": {
+                "email": replacement_member.email if replacement_member else "",
+                "cookie": replacement_cookie,
+            },
+        }
+        job.log("=== 子号移除并安全补号流程完成 ===")
+        if replacement_cookie:
+            job.log(
+                f"=== 新补子号 Cookie [{replacement_member.email}] (可复制) ==="
+            )
+            job.log(replacement_cookie)
+        else:
+            job.log("=== 新补子号未返回 Cookie,请到成员列表查看该子号详情 ===")
     finally:
         db.close()

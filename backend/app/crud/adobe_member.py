@@ -52,6 +52,21 @@ def get_by_email(db: Session, admin_id: int, email: str) -> AdobeMember | None:
     )
 
 
+def find_child_by_email(db: Session, email: str) -> AdobeMember | None:
+    """Find a non-admin child account and thereby identify its mother account."""
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return None
+    return db.scalar(
+        select(AdobeMember)
+        .where(func.lower(AdobeMember.email) == normalized)
+        .where(AdobeMember.admin_id > 0)
+        .where(AdobeMember.is_admin == False)  # noqa: E712
+        .order_by(AdobeMember.updated_at.desc(), AdobeMember.id.desc())
+        .limit(1)
+    )
+
+
 def email_exists_any(db: Session, email: str) -> bool:
     normalized = str(email or "").strip().lower()
     if not normalized:

@@ -235,6 +235,14 @@ export function buildTeam(id: number, count = 9, mode: BuildTeamMode = 'fill'): 
   return request.post(`/adobe-accounts/${id}/members/build-team`, { count, mode })
 }
 
+export function replaceMember(email: string): Promise<JobStatus> {
+  return request.post(
+    '/adobe-accounts/replace-member',
+    { email },
+    { timeout: 30000 },
+  )
+}
+
 export function getJob(jobId: number, logOffset = 0): Promise<JobStatus> {
   return request.get(`/adobe-accounts/jobs/${jobId}`, {
     params: { log_offset: logOffset },

@@ -8,7 +8,9 @@ import {
   NFormItem,
   NInput,
   NInputNumber,
+  NLog,
   NModal,
+  NProgress,
   NSpace,
   NTag,
   NText,
@@ -17,7 +19,7 @@ import {
   type DataTableColumns,
   type FormInst,
 } from 'naive-ui'
-import { computed, h, onMounted, reactive, ref } from 'vue'
+import { computed, h, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import {
@@ -28,9 +30,12 @@ import {
   checkAdobeAdmin,
   createAdobeAccount,
   deleteAdobeAccount,
+  cancelJob,
+  getJob,
   listAdobeAccounts,
   loginAdobeAdmin,
   quickAddAdobeAccount,
+  replaceMember,
   startManualAdobeLogin,
   syncAdobeMembers,
   testAdobeEmail,
@@ -38,6 +43,7 @@ import {
   verifyManualAdobeLogin,
   type AdobeAccount,
   type AdobeAccountForm,
+  type JobStatus,
 } from '@/api/adobe'
 import BatchImportModal from '@/components/BatchImportModal.vue'
 import MembersDrawer from './MembersDrawer.vue'
@@ -110,6 +116,116 @@ function openQuickAdd() {
   quickAddContent.value = ''
   quickAddLogs.value = []
   quickAddModal.value = true
+}
+
+// 按子号邮箱移除并安全补号
+const replaceEmail = ref('')
+const replaceModal = ref(false)
+const replaceJob = ref<JobStatus | null>(null)
+const replaceStarting = ref(false)
+const replaceStopping = ref(false)
+let replacePollTimer: number | null = null
+
+const replaceRunning = computed(() => replaceJob.value?.status === 'running')
+const replaceLogText = computed(() => (replaceJob.value?.logs ?? []).join('\n'))
+const replacePercent = computed(() => {
+  const target = replaceJob.value?.target || 0
+  if (!target) return 0
+  return Math.min(100, Math.round(((replaceJob.value?.success || 0) / target) * 100))
+})
+const replaceMessage = computed(() => replaceJob.value?.extra?.teams?.[0]?.message || '')
+const replaceCookie = computed(() => {
+  const result = replaceJob.value?.result as
+    | { replacement?: { cookie?: string } }
+    | null
+    | undefined
+  return result?.replacement?.cookie || ''
+})
+
+async function copyReplaceCookie() {
+  const cookie = replaceCookie.value
+  if (!cookie) return
+  try {
+    await navigator.clipboard.writeText(cookie)
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = cookie
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.focus()
+    textarea.select()
+    document.execCommand('copy')
+    textarea.remove()
+  }
+  window.$message?.success('Cookie 已复制')
+}
+
+function stopReplacePoll() {
+  if (replacePollTimer !== null) {
+    window.clearInterval(replacePollTimer)
+    replacePollTimer = null
+  }
+}
+
+function startReplacePoll() {
+  stopReplacePoll()
+  replacePollTimer = window.setInterval(async () => {
+    const id = replaceJob.value?.id
+    if (!id) return
+    try {
+      replaceJob.value = await getJob(id)
+      if (replaceJob.value.status !== 'running') {
+        replaceStopping.value = false
+        stopReplacePoll()
+        await fetchData()
+      }
+    } catch {
+      replaceStopping.value = false
+      stopReplacePoll()
+    }
+  }, 2000)
+}
+
+async function handleReplaceMember() {
+  const email = replaceEmail.value.trim()
+  if (!email || !email.includes('@')) {
+    window.$message?.warning('请输入有效的子号邮箱')
+    return
+  }
+  stopReplacePoll()
+  replaceJob.value = null
+  replaceStopping.value = false
+  replaceModal.value = true
+  replaceStarting.value = true
+  try {
+    replaceJob.value = await replaceMember(email)
+    replaceEmail.value = ''
+    if (replaceJob.value.status === 'running') startReplacePoll()
+    else await fetchData()
+  } catch {
+    replaceModal.value = false
+  } finally {
+    replaceStarting.value = false
+  }
+}
+
+async function stopReplaceMember() {
+  const id = replaceJob.value?.id
+  if (!id || !replaceRunning.value) return
+  replaceStopping.value = true
+  try {
+    const res = await cancelJob(id)
+    window.$message?.warning(res.message || '已请求停止任务')
+    replaceJob.value = await getJob(id)
+    if (replaceJob.value.status !== 'running') {
+      replaceStopping.value = false
+      stopReplacePoll()
+      await fetchData()
+    }
+  } catch {
+    replaceStopping.value = false
+  }
 }
 
 async function submitQuickAdd() {
@@ -572,6 +688,7 @@ function handleSearch() {
 }
 
 onMounted(fetchData)
+onUnmounted(stopReplacePoll)
 </script>
 
 <template>
@@ -600,6 +717,23 @@ onMounted(fetchData)
           <NButton type="error" :disabled="!checkedRowKeys.length" @click="handleBatchDelete">
             批量删除
           </NButton>
+          <NSpace :size="6" align="center">
+            <NInput
+              v-model:value="replaceEmail"
+              placeholder="输入子号邮箱"
+              clearable
+              style="width: 220px"
+              @keyup.enter="handleReplaceMember"
+            />
+            <NButton
+              type="warning"
+              :loading="replaceStarting"
+              :disabled="replaceStarting"
+              @click="handleReplaceMember"
+            >
+              移除并安全补号
+            </NButton>
+          </NSpace>
         </NSpace>
         <NSpace>
           <NInput
@@ -718,6 +852,99 @@ onMounted(fetchData)
       :import-fn="batchImportAdobeAccounts"
       @success="fetchData"
     />
+
+    <!-- 移除子号并安全补号任务 -->
+    <NModal
+      v-model:show="replaceModal"
+      preset="card"
+      title="移除子号并安全补号"
+      style="width: 680px"
+      :mask-closable="!replaceRunning && !replaceStarting"
+      :closable="!replaceRunning && !replaceStarting"
+    >
+      <NSpace vertical size="large">
+        <NText depth="3" style="font-size: 12px">
+          流程: 自动找到子号所属母号 → 调用批量移除 → 等待 5 秒 → 使用安全补号补 1 个。
+        </NText>
+        <template v-if="replaceJob">
+          <NText>
+            进度:成功 {{ replaceJob.success }} / 目标 {{ replaceJob.target }} · 失败
+            {{ replaceJob.fail }}
+            <NTag
+              v-if="replaceJob.status === 'done'"
+              type="success"
+              size="small"
+              round
+              style="margin-left: 8px"
+            >已完成</NTag>
+            <NTag
+              v-else-if="replaceJob.status === 'error'"
+              type="error"
+              size="small"
+              round
+              style="margin-left: 8px"
+            >出错</NTag>
+            <NTag
+              v-else-if="replaceJob.status === 'cancelled'"
+              type="warning"
+              size="small"
+              round
+              style="margin-left: 8px"
+            >已停止</NTag>
+            <NTag v-else type="info" size="small" round style="margin-left: 8px">进行中</NTag>
+          </NText>
+          <NProgress
+            type="line"
+            :percentage="replacePercent"
+            :status="replaceJob.status === 'error' ? 'error' : replaceJob.status === 'done' ? 'success' : replaceJob.status === 'cancelled' ? 'warning' : 'default'"
+          />
+          <NText v-if="replaceJob.error" type="error" style="font-size: 12px">
+            {{ replaceJob.error }}
+          </NText>
+          <NText v-if="replaceMessage" type="warning" style="font-size: 12px">
+            {{ replaceMessage }}
+          </NText>
+          <NLog
+            :log="replaceLogText"
+            :rows="14"
+            trim
+            style="border: 1px solid #eee; border-radius: 6px"
+          />
+          <NSpace v-if="replaceCookie" vertical size="small">
+            <NText strong>新补子号 Cookie</NText>
+            <NInput
+              :value="replaceCookie"
+              type="textarea"
+              readonly
+              :autosize="{ minRows: 3, maxRows: 8 }"
+            />
+            <NButton type="primary" secondary @click="copyReplaceCookie">
+              复制 Cookie
+            </NButton>
+          </NSpace>
+        </template>
+        <NText v-else depth="3">正在创建任务 …</NText>
+      </NSpace>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton
+            :disabled="replaceRunning || replaceStarting"
+            @click="replaceModal = false"
+          >
+            关闭
+          </NButton>
+          <NButton
+            v-if="replaceRunning"
+            type="error"
+            secondary
+            :loading="replaceStopping"
+            @click="stopReplaceMember"
+          >
+            停止任务
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
 
     <!-- 批量拉号弹窗 -->
     <NModal v-model:show="batchModal" preset="card" title="批量拉号" style="width: 520px">
