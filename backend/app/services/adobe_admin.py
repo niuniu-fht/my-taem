@@ -113,6 +113,93 @@ def _read_sub_account(auth: "AdminAuth") -> dict[str, Any]:
     return data
 
 
+def create_sub_account(
+    auth: "AdminAuth", email: str, lf: LogFn, password: str = COMPLETE_PASSWORD,
+    *, country: str = "", locale: str = "",
+) -> dict[str, Any]:
+    """通过注册接口创建个人账号,登录后返回账号资料。"""
+    if not country or not locale:
+        cfg_country, cfg_locale = _register_region()
+        country = country or cfg_country
+        locale = locale or cfg_locale
+    first, last = _random_name()
+    dob = _random_dob()
+    lf(
+        f"开始创建个人账号(姓名 {first} {last} / 生日 {dob['year']} / "
+        f"地区 {country})…"
+    )
+
+    for path, body in (
+        ("/signin/v1/passwords/validity?existingUser=false", {"password": password}),
+        ("/signin/v1/passwords/leak_verification", {"username": email, "password": password}),
+    ):
+        try:
+            auth.client.post(
+                f"{_AUTH_HOST}{path}", headers=auth.headers(), json=body, timeout=15,
+            )
+        except Exception:
+            pass
+
+    payload = {
+        "account": {
+            "email": email,
+            "phoneNumber": None,
+            "firstName": first,
+            "lastName": last,
+            "password": password,
+            "countryCode": country,
+            "fullName": None,
+            "phoneticFirstName": None,
+            "phoneticLastName": None,
+            "termsOfUseAcceptances": [
+                {"accepted": True, "name": "ADOBE_MASTER", "language": locale}
+            ],
+            "marketingConsent": {"text": _MARKETING_CONSENT_TEXT, "accepted": True},
+            "isPasswordless": False,
+            "type": "individual",
+            "dateOfBirth": dob,
+        },
+        "clientRedirect": "",
+        "redirectUri": auth.redirect,
+        "regionalOptInKorea": None,
+        "regionalOptInChina": None,
+        "locale": locale,
+        "idpFlow": "login",
+        "inviteCode": None,
+    }
+    try:
+        r = auth.client.post(
+            f"{_AUTH_HOST}/signin/v2/accounts",
+            headers=auth.headers(), json=payload, timeout=30,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise AdminError(f"创建个人账号请求异常:{e}") from e
+    auth.auth_state_encrypted = r.headers.get(
+        "x-ims-authentication-state-encrypted", auth.auth_state_encrypted,
+    )
+    auth.identity_verification_token = r.headers.get(
+        "x-identity-verification-token", auth.identity_verification_token,
+    )
+    if r.status_code not in (200, 201):
+        raise AdminError(f"创建个人账号失败 {r.status_code}: {(r.text or '')[:300]}")
+    try:
+        data = r.json() if isinstance(r.json(), dict) else {}
+    except Exception:
+        data = {}
+    token = (
+        data.get("token") or data.get("access_token") or _p.extract_token_from_obj(data)
+        if isinstance(data, dict)
+        else ""
+    )
+    if token:
+        auth.susi_token = token
+    elif not auth.password_susi(email, password):
+        detail = getattr(auth, "last_auth_error", "")
+        raise AdminError(f"个人账号已创建但登录失败{': ' + detail if detail else ''}")
+    lf("✓ 个人账号创建并登录成功")
+    return _read_sub_account(auth)
+
+
 def register_sub_account_profile(
     auth: "AdminAuth", email: str, lf: LogFn, password: str = COMPLETE_PASSWORD,
     *, country: str = "", locale: str = "",
@@ -355,24 +442,35 @@ def _pop_manual_login_session(session_id: str, *, keep: bool = False) -> dict[st
 # 登录流程辅助(自动识别 密码 / 免密码 / MFA 账号)
 # ----------------------------------------------------------------------------
 
-def _probe_auth_methods(auth: "AdminAuth", email: str) -> list[str]:
+def _probe_auth_accounts(auth: "AdminAuth", email: str) -> list[dict[str, Any]]:
     r = auth.client.post(
         f"{_AUTH_HOST}/signin/v2/users/accounts",
-        headers=auth.headers(), json={"email": email}, timeout=20,
+        headers=auth.headers(),
+        json={"username": email, "usernameType": "EMAIL"},
+        timeout=20,
     )
     auth.auth_state_encrypted = r.headers.get(
         "x-ims-authentication-state-encrypted", auth.auth_state_encrypted)
     auth.identity_verification_token = r.headers.get(
         "x-identity-verification-token", auth.identity_verification_token)
-    methods: list[str] = []
+    if r.status_code != 200:
+        raise AdminError(f"探测账号状态失败 {r.status_code}: {(r.text or '')[:300]}")
     try:
         data = r.json()
-        accounts = data if isinstance(data, list) else [data]
-        for acc in accounts:
-            if isinstance(acc, dict):
-                methods += [str(m) for m in (acc.get("authenticationMethods") or [])]
     except Exception:
-        pass
+        return []
+    accounts = data if isinstance(data, list) else [data]
+    return [acc for acc in accounts if isinstance(acc, dict) and acc]
+
+
+def _probe_auth_methods(auth: "AdminAuth", email: str) -> list[str]:
+    methods: list[str] = []
+    for acc in _probe_auth_accounts(auth, email):
+        for method in acc.get("authenticationMethods") or []:
+            if isinstance(method, dict):
+                methods.append(str(method.get("id") or method.get("type") or ""))
+            else:
+                methods.append(str(method))
     return methods
 
 
@@ -513,7 +611,11 @@ def _passwordless_login(
 ) -> None:
     poll = poll or _p.poll_otp
     if not auth.start_email_mfa(email):
-        raise AdminError("发起邮箱验证失败 (authenticationstate)")
+        detail = getattr(auth, "last_auth_error", "")
+        raise AdminError(
+            "发起邮箱验证失败 (authenticationstate)"
+            + (f": {detail}" if detail else "")
+        )
     _refresh_incomplete_challenge(auth)
     _send_incomplete_account_email(auth)
     lf("已发送验证码邮件 …")

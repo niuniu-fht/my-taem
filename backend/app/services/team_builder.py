@@ -48,6 +48,24 @@ def _is_rate_limited(message: str, rec: dict | None = None) -> bool:
     )
 
 
+def _is_registration_environment_blocked(message: str) -> bool:
+    text = str(message or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "authenticationstate",
+            "captcha_required",
+            "captcha required",
+            "genuine_token",
+            "abuse_detected",
+            "quota_exceeded",
+            "ip_access_not_allowed",
+            "login retry policy exceeded",
+            "temporarily locked",
+        )
+    )
+
+
 def _max_attempts_for_target(count: int, remaining: int) -> int:
     base = max(int(count or 0), int(remaining or 0), 1)
     return max(remaining, min(_MAX_ATTEMPTS_PER_TEAM, base * _MAX_ATTEMPT_MULTIPLIER))
@@ -115,7 +133,7 @@ def _register_one(
     extra_products: list[tuple[str, str]] | None = None,
 ) -> tuple[bool, dict, str]:
     """对单个邮箱执行:注册账号 → 拉取用户授权 → 切换企业资料。"""
-    job.log(f"{prefix}[{email}] 注册个人账号中(收验证码,最长约 3 分钟)…")
+    job.log(f"{prefix}[{email}] 注册个人账号中…")
     sub_logs: list[str] = []
     grant_result: dict = {}
 
@@ -171,11 +189,12 @@ def _register_one(
         detail = str(e)[:220]
         if "429" not in detail and any(_is_rate_limited(x) for x in sub_logs):
             detail = f"{detail} (检测到 Adobe 429 限流)"
-        error_code = (
-            "enterprise_switch_failed_after_grant"
-            if member_granted
-            else "registration_failed_before_grant"
-        )
+        if member_granted:
+            error_code = "enterprise_switch_failed_after_grant"
+        elif _is_rate_limited(detail) or _is_registration_environment_blocked(detail):
+            error_code = "registration_environment_blocked"
+        else:
+            error_code = "registration_failed_before_grant"
         stage = "企业资料切换失败" if member_granted else "账号注册失败"
         return (
             False,
@@ -509,6 +528,9 @@ def _build_one_team(
                         },
                     )
                     job.log(f"{prefix}⚠ [{email}] {stage},已自动停用该邮箱并换号")
+                elif rec.get("error_code") == "registration_environment_blocked":
+                    email_crud.mark_unused_by_email(db, email)
+                    job.log(f"{prefix}⚠ [{email}] 注册环境受限,已保留邮箱并停止本轮")
                 elif rec.get("error_code") == "license_exhausted":
                     email_crud.mark_unused_by_email(db, email)
                 else:
@@ -544,6 +566,8 @@ def _build_one_team(
                     consecutive_rate_limited = 0
                 if rec.get("error_code") == "license_exhausted":
                     stop_reason = "Creative Cloud Pro 授权许可数量已满"
+                elif rec.get("error_code") == "registration_environment_blocked":
+                    stop_reason = msg
 
         email_crud.reconcile_usage_by_emails(db, claimed_emails)
         account.member_count = member_crud.count_by_admin(db, admin_id)
