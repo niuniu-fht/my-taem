@@ -298,9 +298,8 @@ def register_account(
     *, email: str, refresh_token: str, client_id: str,
     mail_url: str = "", proxy_url: str = "", otp_timeout: int = 180,
     log: Optional[LogFn] = None,
-    before_enterprise_switch: Optional[Callable[[], None]] = None,
 ) -> dict[str, Any]:
-    """注册个人账号,执行可选拉取回调,再切企业并获取 Firefly 凭据。
+    """子账号自助登录(免密码验证码)→ 拿 firefly token + cookie + credits。
 
     返回 newbanana 记录:{access_token, cookie, credits, expires_at, display_name, user_id}。
     """
@@ -323,24 +322,14 @@ def register_account(
         auth.authorize(email, "en_US")
         methods = _adm._probe_auth_methods(auth, email)
         lf(f"子号 {email} 认证方式:{', '.join(methods) if methods else '无(免密码)'}")
-        # 先通过 incompleteAccount 验证码会话创建或登录个人账号。
+        # 子号(被邀请的 TYPE2E)通常是免密码账号,用验证码登录
         _adm._passwordless_login(auth, email, lf, poll=poller, otp_timeout=otp_timeout)
-        # 先创建/补全个人账号。安全拉号会在账号注册成功后通过回调邀请该用户,
-        # 随后再读取新生成的企业链接并切换资料。
-        account_data = _adm.register_sub_account_profile(auth, email, lf)
-        if before_enterprise_switch is not None:
-            lf("个人账号注册完成,开始拉取用户并分配产品…")
-            before_enterprise_switch()
-            account_data = None
-
-        # 激活企业资料并切换会话。企业资料接口偶发会用旧 susi token 返回 401;
-        # 复用同一认证会话,
+        # 首次登录的被邀请号需补全账号(姓名/密码/生日)并激活企业资料。
+        # 企业资料接口偶发会用旧 susi token 返回 401;复用同一认证会话,
         # 直接走 FF-iOS 的授权刷新链路,避免再次收码或移除已邀请成员。
         ios_result: dict[str, Any] | None = None
         try:
-            _adm.switch_sub_account_to_enterprise(
-                auth, lf, account_data=account_data,
-            )
+            _adm.complete_sub_account(auth, email, lf)
         except _adm.AdminError as exc:
             detail = str(exc)
             if "401" not in detail and "invalid_token" not in detail.lower():

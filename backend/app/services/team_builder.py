@@ -1,8 +1,8 @@
 """拉号编排:为 Adobe 母号凑满 N 个已注册可用的子号(支持单主号 / 多主号批量)。
 
-流程(每个子号):从邮箱池取未使用邮箱 → 注册个人账号 → 母号拉取用户并分配产品
-→ 子号切换企业资料并获取 firefly token/cookie/credits。任一阶段失败后按既有规则
-清理远端成员并换下一个邮箱重拉,直到注册成功数达到目标或邮箱池耗尽。
+流程(每个子号):从邮箱池取未使用邮箱 → 邀请并分配产品(授权)→ 子号自助登录拿
+firefly token/cookie/credits(注册)。登录成功但额度不可用时保留为待母号审批;
+失败则把该成员从组织移除并换下一个邮箱重拉,直到注册成功数达到目标或邮箱池耗尽。
 批量时按主号顺序处理,主号未登录会自动登录。
 """
 
@@ -103,46 +103,19 @@ def _registered_count_for_admin(
     )
 
 
-class _GrantMemberError(RuntimeError):
-    def __init__(self, result: dict):
-        super().__init__(str(result.get("message") or "拉取用户/授权失败"))
-        self.result = result
-
-
 def _register_one(
     *, token: str, org_id: str, product_id: str, lgid: str, proxy_url: str,
     email: str, refresh_token: str, client_id: str, job: Job, prefix: str = "",
     extra_products: list[tuple[str, str]] | None = None,
 ) -> tuple[bool, dict, str]:
-    """对单个邮箱执行:注册账号 → 拉取用户授权 → 切换企业资料。"""
-    job.log(f"{prefix}[{email}] 注册个人账号中(收验证码,最长约 3 分钟)…")
-    sub_logs: list[str] = []
-    grant_result: dict = {}
-
-    def _sub_log(message: str) -> None:
-        sub_logs.append(str(message or ""))
-        job.log(f"{prefix}[{email}] {message}")
-
-    def _grant_registered_account() -> None:
-        result = adobe_admin.grant_member(
-            token=token, org_id=org_id, product_id=product_id,
-            license_group_id=lgid, email=email, proxy_url=proxy_url,
-            extra_products=extra_products or [],
-        )
-        grant_result.update(result)
-        if not result.get("ok"):
-            raise _GrantMemberError(result)
-        job.log(f"{prefix}[{email}] 用户拉取及产品授权成功,开始切换企业资料…")
-
-    try:
-        rec = firefly.register_account(
-            email=email, refresh_token=refresh_token, client_id=client_id,
-            proxy_url=proxy_url, otp_timeout=180,
-            log=_sub_log,
-            before_enterprise_switch=_grant_registered_account,
-        )
-    except _GrantMemberError as e:
-        g = e.result
+    """对单个邮箱执行:授权 + 注册。返回 (是否成功, newbanana记录, 失败原因)。"""
+    job.log(f"{prefix}[{email}] 邀请 + 分配产品(授权)…")
+    g = adobe_admin.grant_member(
+        token=token, org_id=org_id, product_id=product_id,
+        license_group_id=lgid, email=email, proxy_url=proxy_url,
+        extra_products=extra_products or [],
+    )
+    if not g.get("ok"):
         if g.get("error_code") in {"trial_already_consumed", "assign_product_failed"}:
             try:
                 adobe_admin.remove_member(
@@ -157,33 +130,39 @@ def _register_one(
         return (
             False,
             {"error_code": g.get("error_code") or ""},
-            f"拉取用户/授权失败:{g.get('message') or ''}"[:480],
+            f"授权失败:{g.get('message') or ''}"[:480],
+        )
+
+    job.log(f"{prefix}[{email}] 授权成功,子号登录注册中(收验证码,最长约 3 分钟)…")
+    sub_logs: list[str] = []
+
+    def _sub_log(message: str) -> None:
+        sub_logs.append(str(message or ""))
+        job.log(f"{prefix}[{email}] {message}")
+
+    try:
+        rec = firefly.register_account(
+            email=email, refresh_token=refresh_token, client_id=client_id,
+            proxy_url=proxy_url, otp_timeout=180,
+            log=_sub_log,
         )
     except Exception as e:  # noqa: BLE001
-        member_granted = bool(grant_result.get("ok"))
-        if member_granted:
-            try:
-                adobe_admin.remove_member(
-                    token=token, org_id=org_id, email=email, proxy_url=proxy_url
-                )
-            except Exception:
-                pass
+        # 失败:把刚加入的成员从组织移除(失败的删除),以便换号重拉
+        try:
+            adobe_admin.remove_member(
+                token=token, org_id=org_id, email=email, proxy_url=proxy_url
+            )
+        except Exception:
+            pass
         detail = str(e)[:220]
         if "429" not in detail and any(_is_rate_limited(x) for x in sub_logs):
             detail = f"{detail} (检测到 Adobe 429 限流)"
-        error_code = (
-            "enterprise_switch_failed_after_grant"
-            if member_granted
-            else "registration_failed_before_grant"
-        )
-        stage = "企业资料切换失败" if member_granted else "账号注册失败"
         return (
             False,
-            {"error_code": error_code},
-            f"{stage}:{detail}",
+            {"error_code": "registration_failed_after_grant"},
+            f"注册失败:{detail}",
         )
 
-    g = grant_result
     rec["member_id"] = g.get("member_id", "")
     credits = rec.get("credits")
     if rec.get("needs_authorization") or not firefly.has_team_credits(credits):
@@ -478,29 +457,17 @@ def _build_one_team(
                         remark=f"{account.email}:免费会员资格已消耗",
                     )
                     job.log(f"{prefix}⚠ [{email}] 免费会员资格已消耗,已自动停用该邮箱")
-                elif rec.get("error_code") in {
-                    "registration_failed_before_grant",
-                    "enterprise_switch_failed_after_grant",
-                }:
-                    stage = (
-                        "企业资料切换失败"
-                        if rec.get("error_code") == "enterprise_switch_failed_after_grant"
-                        else "账号注册失败"
-                    )
+                elif rec.get("error_code") == "registration_failed_after_grant":
                     email_crud.disable_by_emails(
                         db,
                         [email],
-                        remark=f"{account.email}:{stage}已触碰 Adobe",
+                        remark=f"{account.email}:注册失败已触碰 Adobe",
                     )
                     member_crud.upsert(
                         db,
                         admin_id,
                         email=email,
-                        status=(
-                            "removed_enterprise_switch_failed"
-                            if rec.get("error_code") == "enterprise_switch_failed_after_grant"
-                            else "register_failed"
-                        ),
+                        status="removed_register_failed",
                         message=msg,
                         extra={
                             "registered": False,
@@ -508,7 +475,7 @@ def _build_one_team(
                             "client_id": p["client_id"],
                         },
                     )
-                    job.log(f"{prefix}⚠ [{email}] {stage},已自动停用该邮箱并换号")
+                    job.log(f"{prefix}⚠ [{email}] 注册失败,已自动停用该邮箱并换号")
                 elif rec.get("error_code") == "license_exhausted":
                     email_crud.mark_unused_by_email(db, email)
                 else:

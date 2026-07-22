@@ -100,30 +100,26 @@ def _random_dob() -> dict[str, int]:
     }
 
 
-def _read_sub_account(auth: "AdminAuth") -> dict[str, Any]:
-    r = auth.client.get(
-        f"{_AUTH_HOST}/signin/v1/accounts/me?client_id={auth.client_id}",
-        headers=auth.headers(), timeout=20,
-    )
-    if r.status_code != 200:
-        raise AdminError(f"读取子号资料失败 {r.status_code}: {(r.text or '')[:200]}")
-    data = r.json()
-    if not isinstance(data, dict) or not data:
-        raise AdminError("读取子号资料失败:响应为空")
-    return data
-
-
-def register_sub_account_profile(
+def complete_sub_account(
     auth: "AdminAuth", email: str, lf: LogFn, password: str = COMPLETE_PASSWORD,
     *, country: str = "", locale: str = "",
-) -> dict[str, Any]:
-    """补全个人账号资料并返回最新资料,不处理企业资料切换。"""
+) -> None:
+    """被邀请子号首次登录:若账号未补全,自动填写姓名/密码/生日并接受条款,
+    然后激活并切换到企业(被邀请)资料,使后续可换取 firefly token。
+
+    复用收到验证码后的 incompleteAccount 会话(auth.susi_token)。幂等:已补全则只切资料。
+    """
     try:
-        data = _read_sub_account(auth)
+        r = auth.client.get(
+            f"{_AUTH_HOST}/signin/v1/accounts/me?client_id={auth.client_id}",
+            headers=auth.headers(), timeout=20,
+        )
+        data = r.json() if r.status_code == 200 else {}
     except Exception as e:  # noqa: BLE001
-        if isinstance(e, AdminError):
-            raise
-        raise AdminError(f"读取子号资料失败:{e}") from e
+        lf(f"读取子号资料失败:{e}")
+        return
+    if not isinstance(data, dict) or not data:
+        return
 
     profile = data.get("profileData") or {}
     actions = profile.get("actions") or []
@@ -182,27 +178,22 @@ def register_sub_account_profile(
                 headers=auth.headers(), json=payload, timeout=25,
             )
         except Exception as e:  # noqa: BLE001
-            raise AdminError(f"补全账号请求异常:{e}") from e
+            lf(f"补全账号请求异常:{e}")
+            return
         if r.status_code != 200:
-            raise AdminError(f"补全账号失败 {r.status_code}: {(r.text or '')[:200]}")
+            lf(f"✗ 补全账号失败 {r.status_code}: {(r.text or '')[:200]}")
+            return
         lf("✓ 已补全账号资料")
+        # 重新拉取资料,拿到更新后的链接
         try:
-            data = _read_sub_account(auth)
-        except Exception as e:  # noqa: BLE001
-            raise AdminError(f"补全账号后重新读取资料失败:{e}") from e
-    else:
-        lf("✓ 账号资料已完整")
-    return data
-
-
-def switch_sub_account_to_enterprise(
-    auth: "AdminAuth", lf: LogFn, *, account_data: dict[str, Any] | None = None,
-) -> None:
-    """读取企业资料链接,激活并将当前子号会话切换到企业资料。"""
-    data = account_data or {}
-    if not data:
-        data = _read_sub_account(auth)
-    profile = data.get("profileData") or {}
+            r = auth.client.get(
+                f"{_AUTH_HOST}/signin/v1/accounts/me?client_id={auth.client_id}",
+                headers=auth.headers(), timeout=20,
+            )
+            data = r.json() if r.status_code == 200 else data
+            profile = data.get("profileData") or {}
+        except Exception:
+            pass
 
     # 选择并激活企业(被邀请)资料。这里必须拿到企业资料 token;
     # 否则后续 Firefly token 会落在个人上下文,额度接口会返回 ErrMismatchOauthToken。
@@ -212,16 +203,14 @@ def switch_sub_account_to_enterprise(
         link = next((lk for lk in links if lk.get("status") == "active"), None) \
             or next((lk for lk in links if lk.get("ident")), None)
         if not link:
-            last_switch_error = "企业资料链接尚未生成"
-            lf(f"{last_switch_error},等待后重试 ({switch_attempt}/3)")
-        else:
-            ident = link.get("ident")
-            guid = link.get("entitlementAccountUserId") or ""
-            desc = link.get("description") or "-"
-            if not ident:
-                raise AdminError("企业资料缺少 linkId,无法切换")
+            raise AdminError("无企业资料链接,无法切换到团队资料")
+        ident = link.get("ident")
+        guid = link.get("entitlementAccountUserId") or ""
+        desc = link.get("description") or "-"
+        if not ident:
+            raise AdminError("企业资料缺少 linkId,无法切换")
 
-        if link and link.get("status") != "active":
+        if link.get("status") != "active":
             try:
                 r = auth.client.post(
                     f"{_AUTH_HOST}/signin/v2/links/{ident}",
@@ -243,7 +232,7 @@ def switch_sub_account_to_enterprise(
                 last_switch_error = f"激活企业资料异常:{e}"
                 lf(last_switch_error)
 
-        if link and guid:
+        if guid:
             try:
                 auth.client.put(
                     f"{_AUTH_HOST}/signin/v1/filterprofilemapping",
@@ -255,8 +244,6 @@ def switch_sub_account_to_enterprise(
                 lf(f"设置企业资料偏好异常:{e}")
 
         try:
-            if not link:
-                raise LookupError(last_switch_error)
             lf(f"切换企业资料尝试 {switch_attempt}/3:{desc}")
             r = auth.client.post(
                 f"{_AUTH_HOST}/signin/v1/accounts/tokens",
@@ -293,17 +280,6 @@ def switch_sub_account_to_enterprise(
             pass
 
     raise AdminError(last_switch_error or "切换企业资料失败,无法继续获取团队 Firefly token")
-
-
-def complete_sub_account(
-    auth: "AdminAuth", email: str, lf: LogFn, password: str = COMPLETE_PASSWORD,
-    *, country: str = "", locale: str = "",
-) -> None:
-    """兼容入口:补全个人账号后激活并切换到企业资料。"""
-    data = register_sub_account_profile(
-        auth, email, lf, password, country=country, locale=locale,
-    )
-    switch_sub_account_to_enterprise(auth, lf, account_data=data)
 
 def _mklog(log: Optional[LogFn]) -> LogFn:
     return log if callable(log) else (lambda _m: None)
