@@ -321,31 +321,13 @@ def register_account(
             redirect=FIREFLY_REDIRECT,
         )
         auth.authorize(email, "en_US")
-        accounts = _adm._probe_auth_accounts(auth, email)
-        methods: list[str] = []
-        for account in accounts:
-            for method in account.get("authenticationMethods") or []:
-                if isinstance(method, dict):
-                    methods.append(str(method.get("id") or method.get("type") or ""))
-                else:
-                    methods.append(str(method))
-        lf(
-            f"子号 {email} 账号状态:"
-            + (f"已存在,认证方式 {', '.join(filter(None, methods)) or '免密码'}" if accounts else "未注册")
-        )
-        if not accounts:
-            account_data = _adm.create_sub_account(auth, email, lf)
-        else:
-            has_password = any("password" in method.lower() for method in methods)
-            if has_password and auth.password_susi(email, _adm.COMPLETE_PASSWORD):
-                lf("✓ 已存在个人账号密码登录成功")
-            else:
-                _adm._passwordless_login(
-                    auth, email, lf, poll=poller, otp_timeout=otp_timeout,
-                )
-            account_data = _adm.register_sub_account_profile(auth, email, lf)
-
-        # 安全拉号在账号注册成功后邀请用户,随后读取企业链接并切换资料。
+        methods = _adm._probe_auth_methods(auth, email)
+        lf(f"子号 {email} 认证方式:{', '.join(methods) if methods else '无(免密码)'}")
+        # 先通过 incompleteAccount 验证码会话创建或登录个人账号。
+        _adm._passwordless_login(auth, email, lf, poll=poller, otp_timeout=otp_timeout)
+        # 先创建/补全个人账号。安全拉号会在账号注册成功后通过回调邀请该用户,
+        # 随后再读取新生成的企业链接并切换资料。
+        account_data = _adm.register_sub_account_profile(auth, email, lf)
         if before_enterprise_switch is not None:
             lf("个人账号注册完成,开始拉取用户并分配产品…")
             before_enterprise_switch()

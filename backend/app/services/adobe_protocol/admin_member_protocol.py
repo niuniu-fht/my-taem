@@ -166,7 +166,6 @@ class AdminAuth:
         self.debug_id = ""
         self.identity_verification_token = ""
         self.auth_state_encrypted = ""
-        self.last_auth_error = ""
 
     def _gen_debug_id(self) -> str:
         if not self.debug_id:
@@ -251,11 +250,9 @@ class AdminAuth:
                 token = ""
             if token:
                 self.susi_token = token
-                self.last_auth_error = ""
                 log("[login] password SUSI ok")
                 return True
-        self.last_auth_error = f"status={r.status_code} body={(r.text or '')[:500]}"
-        log(f"[login] password failed {self.last_auth_error}")
+        log(f"[login] password failed status={r.status_code} body={r.text[:500]}")
         return False
 
     def start_email_mfa(self, email: str) -> bool:
@@ -273,12 +270,10 @@ class AdminAuth:
             timeout=15,
         )
         if r.status_code in (200, 201):
-            self.last_auth_error = ""
             self.identity_verification_token = r.headers.get("x-identity-verification-token", self.identity_verification_token)
             self.auth_state_encrypted = r.headers.get("x-ims-authentication-state-encrypted", self.auth_state_encrypted)
             return True
-        self.last_auth_error = f"status={r.status_code} body={(r.text or '')[:300]}"
-        log(f"[mfa] start failed {self.last_auth_error}")
+        log(f"[mfa] start failed status={r.status_code} body={r.text[:300]}")
         return False
 
     def send_email_challenge(self) -> bool:
